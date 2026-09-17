@@ -309,8 +309,53 @@ def ring_model_2d(params, X, Y):
 PARAM_NAMES = ("xc", "yc", "r0", "sigma", "A", "B")
 
 
+def local_goodness_of_fit(img, xc, yc, r0, sigma, A, B, window_sigmas=3):
+    """
+    Reduced chi-square of the fit, evaluated in a FIXED, common window
+    around the peak (|r - r0| < window_sigmas*sigma) -- the SAME size
+    regardless of how wide any given candidate's own fit domain was, so
+    candidates are compared fairly rather than favoring whichever one
+    happened to use a wider domain.
+
+    This exists because raw SNR (peak amplitude / background noise) can
+    be fooled: a WIDER, less precise fit can blend the true ring peak
+    together with adjacent structure (e.g. the inner blob's declining
+    tail), inflating its apparent amplitude and thus its SNR, while
+    actually matching the real data WORSE than a narrower, more accurate
+    fit with genuinely lower peak height. Confirmed directly on a real
+    frame: the wider/taller fit had SNR=3.74 but local reduced
+    chi-square=5.6 (poor match); a narrower fit seeded from the profile's
+    actual peak had SNR=2.24 but chi-square=1.79 (good match) -- SNR
+    picked the wrong one, this metric picks the right one.
+
+    Lower is better. Not meaningful as an absolute "close to 1.0" pass/
+    fail threshold on its own -- confirmed directly that even
+    known-good, visually-verified fits across several different real
+    images range from ~2 to ~13, likely because the background-region
+    noise estimate isn't a perfect match to true local pixel noise. Use
+    it to RANK candidates against each other, not as a hard cutoff in
+    isolation.
+    """
+    Ny, Nx = img.shape
+    y_idx, x_idx = np.indices((Ny, Nx))
+    r = np.sqrt((x_idx - xc) ** 2 + (y_idx - yc) ** 2)
+    local_mask = np.abs(r - r0) < window_sigmas * sigma
+    if local_mask.sum() < 10:
+        return np.inf
+
+    data = img[local_mask].astype(np.float64)
+    model = ring_model_2d([xc, yc, r0, sigma, A, B], x_idx[local_mask], y_idx[local_mask])
+    resid = data - model
+
+    bg_mask = r > (r0 + 4 * sigma)
+    noise_std = img[bg_mask].astype(np.float64).std() if bg_mask.sum() >= 10 else resid.std()
+    if noise_std <= 0:
+        return np.inf
+    return np.sum(resid ** 2) / (len(data) * noise_std ** 2)
+
+
 def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
-                 annulus_k=4, loss="soft_l1", f_scale=None, max_nfev=300,
+                 annulus_k_lower=1, annulus_k_upper=3, loss="soft_l1", f_scale=None, max_nfev=300,
                  fixed_params=None):
     """
     Fit the 2D ring model directly to image pixels via robust nonlinear
@@ -327,21 +372,26 @@ def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
         None to fit all six parameters freely (identical to previous
         behavior -- verified byte-for-byte).
 
-    The fit domain is restricted to an annulus of width
-    +/- annulus_k * sigma0_guess around r0_guess (measured from the
-    initial center guess). This is NOT optional: fitting over the whole
+    The fit domain is restricted to an ASYMMETRIC annulus around
+    r0_guess: only annulus_k_lower*sigma0_guess inward, but
+    annulus_k_upper*sigma0_guess outward (measured from the initial
+    center guess). Asymmetric on purpose, not a symmetric annulus split
+    two ways: the inner blob sits on the LOWER side, so that side needs
+    to stay tight to exclude it, while the baseline/background genuinely
+    needed to anchor B sits on the OUTER side, which needs more reach to
+    be sampled properly -- a single shared margin can't satisfy both at
+    once (confirmed directly in the related 1D fallback fit: a
+    symmetric window either still included blob pixels or cut the
+    baseline sample too short to estimate correctly, and only fixing the
+    two sides independently resolved it).
+
+    Restricting the domain at all is NOT optional: fitting over the whole
     crop lets a broad, degenerate solution win on total residual, because
     most pixels in an unrestricted domain are "not the ring" (interior
     blob, background) and a broad hump can track that bulk better than a
     sharp, spatially localized true ring can -- reproduced directly, with
     bounds and robust loss both already in place, and only fixed by
-    restricting the domain. The domain needs to be genuinely tight, not
-    just present: annulus_k=6 with a generous sigma0_guess (itself derived
-    from a RANSAC radius that runs a bit large, since edge points cluster
-    at the ring's rising/falling edge rather than its peak) was still wide
-    enough to let leftover interior structure pull the fit into a worse
-    local solution on a real test frame; annulus_k=3-4 reliably avoided
-    this across all cases tried.
+    restricting the domain.
 
     soft_l1 robust loss further downweights whatever doesn't fit the ring
     model within that domain (touching/fused regions, noise, a partial
@@ -391,8 +441,9 @@ def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
     sigma0_eff = fixed_local.get("sigma", sigma0_guess)
 
     r_from_guess = np.sqrt((Xc - xc0_eff) ** 2 + (Yc - yc0_eff) ** 2)
-    margin = annulus_k * sigma0_eff
-    domain_mask = (r_from_guess > max(0, r0_eff - margin)) & (r_from_guess < r0_eff + margin)
+    margin_lower = annulus_k_lower * sigma0_eff
+    margin_upper = annulus_k_upper * sigma0_eff
+    domain_mask = (r_from_guess > max(0, r0_eff - margin_lower)) & (r_from_guess < r0_eff + margin_upper)
 
     if domain_mask.sum() < 20:
         return None  # domain too small/empty to fit anything meaningful
@@ -464,6 +515,8 @@ def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
     # means something for a value the optimizer actually chose.
     not_bound_pinned = ("r0" in fixed_params) or (r0 < 0.95 * upper_all["r0"])
 
+    local_chi2 = local_goodness_of_fit(img, xc + x_lo, yc + y_lo, r0, sigma, A, B)
+
     return {
         "center_x": xc + x_lo,
         "center_y": yc + y_lo,
@@ -472,37 +525,85 @@ def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
         "intensity_peak": A,
         "baseline": B,
         "snr": snr,
+        "local_chi2": local_chi2,
         "ring_shape_ok": ring_shape_ok and not_bound_pinned,
         "success": success,
     }
 
 
+def estimate_r0_from_profile_peak(img, xc, yc, r0_guess, r_min=15, smooth_window=5):
+    """
+    Find the ring's actual radius by looking at where the intensity
+    profile itself peaks, instead of only relying on RANSAC's geometric
+    (gradient-edge) estimate. r_min excludes the inner blob's own
+    structure; r_max_search (2.5*r0_guess) excludes far-field noise
+    fluctuations that can have deceptively high "prominence" over a very
+    wide, mostly-empty search range -- confirmed directly, an unbounded
+    search on a real frame found a spurious peak at r=215 with higher
+    prominence than the real ring at r=25.
+
+    Returns (r0, sigma_estimate), or (None, None) if no clear peak exists
+    in the plausible range.
+    """
+    r, profile = radial_profile(img, xc, yc)
+    r_max_search = 2.5 * r0_guess
+    mask = (r > r_min) & (r < r_max_search)
+    if mask.sum() < 10:
+        return None, None
+    r_m, p_m = r[mask], profile[mask]
+    p_smooth = uniform_filter1d(p_m, size=min(smooth_window, len(p_m)))
+    # prominence relative to the LOCAL (post-blob) range, not the whole
+    # profile -- the whole-profile range is dominated by the much
+    # brighter inner blob, which makes the ring's own (much subtler)
+    # bump fail a prominence check sized for the blob's contrast instead
+    # of the ring's.
+    prominence = 0.1 * (p_m.max() - p_m.min())
+    peaks, props = find_peaks(p_smooth, prominence=prominence)
+    if len(peaks) == 0:
+        return None, None
+    best = peaks[np.argmax(props["prominences"])]
+    r0 = r_m[best]
+    dr = r[1] - r[0] if len(r) > 1 else 1.0
+    widths, *_ = peak_widths(p_smooth, [best], rel_height=0.5)
+    sigma = max(1.0, (widths[0] * dr) / 2.355)
+    return r0, sigma
+
+
 def fit_ring_2d_multistart(img, xc0, yc0, r0_guess, half_size,
                             r0_multipliers=(0.7, 0.85, 1.0, 1.15, 1.3), **kwargs):
     """
-    Run fit_ring_2d from several different initial radius guesses (as
-    multiples of r0_guess) and keep the best result.
+    Run fit_ring_2d from several different initial radius guesses and keep
+    the best result.
+
+    Guesses come from two sources: (1) fixed multiples of r0_guess, which
+    itself comes from RANSAC's GEOMETRIC (gradient-edge) circle fit, and
+    (2) the intensity profile's own actual peak location (see
+    estimate_r0_from_profile_peak) -- added because the geometric estimate
+    and multiplier variations of it don't always land where the intensity
+    itself actually peaks; confirmed directly on a real frame, the profile
+    peak seed gave a materially more accurate radius (residual error 0.65px
+    vs 1.61px against the visually-unambiguous true peak).
 
     If fixed_params (passed through **kwargs) fixes "r0", multi-starting
     over different r0 GUESSES is pointless -- r0 is pinned to the fixed
     value regardless of what any candidate "guesses" -- so a single fit is
     run instead, using r0_guess only to size the fit domain.
 
-    Why this is needed: on marginal-contrast frames, the 2D fit can have
-    two (or more) competing local minima -- the genuine ring, and a
-    degenerate "refit the core blob's own shape" solution (caught by
-    ring_shape_ok, but only after wasting the fit on it). Confirmed
-    directly: which one a single-shot fit lands in can flip based on
-    nothing more than 8-bit vs 16-bit pixel quantization of the SAME
-    underlying image -- i.e. it's a coin flip near the basin boundary, not
-    a real difference in image quality. Trying several starting points and
-    keeping whichever converges to the best-supported, structurally valid
-    ring fixes this: across a real test set, at least one start out of a
-    handful reliably found the genuine ring even when the RANSAC-seeded
-    single-shot fit didn't.
+    Why multiple candidates at all: on marginal-contrast frames, the 2D
+    fit can have two (or more) competing local minima -- the genuine
+    ring, and a degenerate "refit the core blob's own shape" solution
+    (caught by ring_shape_ok, but only after wasting the fit on it).
+    Confirmed directly: which one a single-shot fit lands in can flip
+    based on nothing more than 8-bit vs 16-bit pixel quantization of the
+    SAME underlying image.
 
-    "Best" = highest SNR among candidates that pass ring_shape_ok. Returns
-    None if no candidate passes.
+    "Best" = LOWEST local reduced chi-square (see local_goodness_of_fit)
+    among candidates that pass ring_shape_ok -- NOT highest SNR. Confirmed
+    directly that SNR can be fooled: a wider, less precise fit can blend
+    the true ring with adjacent structure, inflating its apparent
+    amplitude (and thus SNR) while actually matching the real data worse
+    (higher chi-square) than a narrower, more accurate fit. Returns None
+    if no candidate passes.
     """
     fixed_params = kwargs.get("fixed_params") or {}
     if "r0" in fixed_params:
@@ -528,23 +629,32 @@ def fit_ring_2d_multistart(img, xc0, yc0, r0_guess, half_size,
             result2 = fit_ring_2d(img, result["center_x"], result["center_y"],
                                    r0_try, sigma_try, half_size, **kwargs)
             if result2 is not None and result2["ring_shape_ok"] and (
-                    not result["ring_shape_ok"] or result2["snr"] > result["snr"]):
+                    not result["ring_shape_ok"] or result2["local_chi2"] < result["local_chi2"]):
                 result = result2
 
         return result if (result is not None and result["ring_shape_ok"]) else None
 
+    r0_try_list = [r0_guess * mult for mult in r0_multipliers]
+    r0_peak, sigma_peak = estimate_r0_from_profile_peak(img, xc0, yc0, r0_guess)
+    if r0_peak is not None:
+        r0_try_list.append(r0_peak)
+
     best = None
-    for mult in r0_multipliers:
-        r0_try = r0_guess * mult
-        sigma_try = max(1.0, 0.1 * r0_try)  # scale WITH r0_try, not fixed to
-        # the original r0_guess -- a fixed sigma paired with a much
-        # smaller/larger r0_try distorts the intended annulus domain width
-        # (margin = annulus_k * sigma_guess), which can open the door to a
-        # different, spurious local minimum than the same multiplier would
-        # reach with its own properly-scaled domain. Confirmed directly:
-        # this exact mismatch let one candidate escape to a radius=162
-        # nonsense solution that passed both ring_shape_ok and had a
-        # higher SNR than the genuine answer, winning the "best" selection.
+    for r0_try in r0_try_list:
+        # profile-peak candidate brings its own sigma estimate; multiplier
+        # candidates use the usual 0.1*r0_try scaling
+        sigma_try = (sigma_peak if (r0_peak is not None and r0_try == r0_peak)
+                     else max(1.0, 0.1 * r0_try))
+        # scale WITH r0_try, not fixed to the original r0_guess -- a fixed
+        # sigma paired with a much smaller/larger r0_try distorts the
+        # intended annulus domain width (margins = annulus_k_lower/upper *
+        # sigma_guess),
+        # which can open the door to a different, spurious local minimum
+        # than the same multiplier would reach with its own properly-scaled
+        # domain. Confirmed directly: this exact mismatch let one candidate
+        # escape to a radius=162 nonsense solution that passed both
+        # ring_shape_ok and had a higher SNR than the genuine answer,
+        # winning the "best" selection under the old SNR-based criterion.
         result = fit_ring_2d(img, xc0, yc0, r0_try, sigma_try, half_size, **kwargs)
         if result is None or not result["ring_shape_ok"]:
             continue
@@ -552,21 +662,45 @@ def fit_ring_2d_multistart(img, xc0, yc0, r0_guess, half_size,
         # can be False even when the fitted parameters are fine -- with a
         # reduced max_nfev (needed for speed), the optimizer can still land
         # on the correct answer without meeting scipy's internal tolerance
-        # in time. Confirmed directly: a candidate converging to the same
-        # radius as the rest of a real sequence had success=False, while a
-        # genuinely wrong, much-too-small-radius candidate had success=True
-        # and a higher SNR -- so success alone isn't a reliable filter, and
-        # SNR alone can prefer the wrong answer.
+        # in time.
         #
-        # Instead, require the radius to be within a plausible range of the
-        # RANSAC estimate (which, even though imprecise, reflects real edge
-        # geometry and is a genuine scale reference) before comparing SNR at
-        # all. This is what actually rejects the too-small false positive:
-        # its radius was less than a third of the RANSAC estimate.
+        # Require the radius to be within a plausible range of the RANSAC
+        # estimate (which, even though imprecise, reflects real edge
+        # geometry and is a genuine scale reference) before comparing at
+        # all -- rejects mostly-nonsense candidates regardless of the
+        # ranking metric used afterward.
         if not (0.5 * r0_guess <= result["radius"] <= 2.0 * r0_guess):
             continue
-        if best is None or result["snr"] > best["snr"]:
+        if best is None or result["local_chi2"] < best["local_chi2"]:
             best = result
+
+    if best is None:
+        return None
+
+    # Re-seed the winning candidate once, using ITS OWN converged
+    # center/radius/sigma to rebuild the fit domain. Needed because the
+    # domain is built ONCE from each candidate's INITIAL guess and never
+    # re-centered even as xc/yc/r0 move during that fit -- so a candidate
+    # can converge to a real local peak whose domain was nonetheless built
+    # slightly off-target, systematically pulling the result away from the
+    # true peak. Confirmed directly on a real frame: the profile's actual
+    # local maximum was at r=26.5, but every one of the 5 standard
+    # multi-start candidates converged to 23-25 instead -- a small but
+    # visible, reproducible leftward shift, not noise.
+    #
+    # This is NOT applied blindly, though -- confirmed directly that
+    # re-seeding from an already-poor fit can converge to the degenerate
+    # "refit the blob's own shape" solution instead of improving anything
+    # (with a falsely high SNR, the same false-positive pattern guarded
+    # against elsewhere). The same ring_shape_ok + chi2-improvement gate
+    # used for the fixed-r0 path protects against that here too: a
+    # degenerate re-seed attempt fails ring_shape_ok and gets discarded,
+    # keeping the original (already-validated) candidate.
+    reseeded = fit_ring_2d(img, best["center_x"], best["center_y"],
+                           best["radius"], best["sigma"], half_size, **kwargs)
+    if reseeded is not None and reseeded["ring_shape_ok"] and reseeded["local_chi2"] < best["local_chi2"]:
+        best = reseeded
+
     return best
 
 
@@ -743,7 +877,7 @@ def _translate_fixed_params(fixed_params, x_off, y_off):
     return out
 
 
-def locate_ring(img, approx_center=None, half_size=None, min_snr=3.0,
+def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
                  roi_half_size=180, fit_half_size=None, smoothing_sigma=1.5,
                  fixed_params=None):
     """
@@ -758,6 +892,15 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=3.0,
     min_snr : minimum fitted ring amplitude, relative to background noise,
         required to trust the result -- the final backstop against a
         geometrically-plausible circle with no real intensity bump there.
+        Default lowered from 3.0 to 2.0 -- candidates are now selected by
+        local reduced chi-square (goodness of fit), not raw SNR (see
+        fit_ring_2d_multistart), because SNR alone could be fooled by a
+        wider, less accurate fit that inflates its own apparent amplitude.
+        The more accurate fits this produces have correspondingly more
+        honest (and sometimes lower) peak amplitudes, so a threshold tuned
+        for the old, SNR-inflating selection is now too strict. Verified
+        directly: 2.0 still rejects pure noise (no ring at all) while
+        correctly accepting a real, previously-wrongly-rejected fit.
 
     roi_half_size : half-size of the region-of-interest crop used before
         edge detection in the RANSAC stage.
