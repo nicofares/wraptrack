@@ -356,11 +356,23 @@ def local_goodness_of_fit(img, xc, yc, r0, sigma, A, B, window_sigmas=3):
 
 def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
                  annulus_k_lower=1, annulus_k_upper=3, loss="soft_l1", f_scale=None, max_nfev=300,
-                 fixed_params=None):
+                 fixed_params=None, range_lower_px=None, range_upper_px=None):
     """
     Fit the 2D ring model directly to image pixels via robust nonlinear
     least squares, seeded by (xc0, yc0, r0_guess, sigma0_guess) -- e.g.
     from estimate_ring_via_edges.
+
+    range_lower_px, range_upper_px : optional, in pixels. If given, the fit
+        domain is fixed at exactly [r0_guess - range_lower_px, r0_guess +
+        range_upper_px], regardless of sigma0_guess -- e.g.
+        range_lower_px=4, range_upper_px=10 for a domain 4px inside to 10px
+        outside the guessed radius. Overrides annulus_k_lower/upper (the
+        sigma-scaled margins below) for whichever side is given; the other
+        side still uses the sigma-scaled margin if only one is set. Use
+        this when you know a good absolute pixel range for your data (e.g.
+        close to the ring's own sigma from a previous fit) and want it
+        applied literally, not re-derived from whatever sigma this
+        particular candidate happens to guess.
 
     fixed_params : optional dict holding any subset of {"xc", "yc", "r0",
         "sigma", "A", "B"} fixed at a given value -- e.g.
@@ -441,8 +453,8 @@ def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
     sigma0_eff = fixed_local.get("sigma", sigma0_guess)
 
     r_from_guess = np.sqrt((Xc - xc0_eff) ** 2 + (Yc - yc0_eff) ** 2)
-    margin_lower = annulus_k_lower * sigma0_eff
-    margin_upper = annulus_k_upper * sigma0_eff
+    margin_lower = range_lower_px if range_lower_px is not None else annulus_k_lower * sigma0_eff
+    margin_upper = range_upper_px if range_upper_px is not None else annulus_k_upper * sigma0_eff
     domain_mask = (r_from_guess > max(0, r0_eff - margin_lower)) & (r_from_guess < r0_eff + margin_upper)
 
     if domain_mask.sum() < 20:
@@ -879,7 +891,7 @@ def _translate_fixed_params(fixed_params, x_off, y_off):
 
 def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
                  roi_half_size=180, fit_half_size=None, smoothing_sigma=1.5,
-                 fixed_params=None):
+                 fixed_params=None, range_lower_px=None, range_upper_px=None):
     """
     Run the full pipeline on a single image.
 
@@ -936,6 +948,20 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
         there (that path doesn't support it); this is a real, stated
         limitation, not a silent gap.
 
+    range_lower_px, range_upper_px : optional, in pixels. Fixes the fit
+        domain at exactly [guessed_radius - range_lower_px, guessed_radius
+        + range_upper_px], instead of scaling it off whatever sigma each
+        individual candidate happens to guess (see fit_ring_2d and
+        fit_ring_2d_multistart for why that scaling exists and its
+        limitation: the window is sized from the INITIAL guess's sigma,
+        not the fit's own converged sigma, so it can be poorly matched to
+        a specific image's true ring width). Use this when you have a
+        good sense of the right absolute pixel range for your data --
+        e.g. close to the ring's sigma from a previous good fit on a
+        similar frame -- and want that applied literally across frames,
+        rather than re-derived per-candidate. Passed straight through to
+        every candidate tried, including the profile-peak-seeded one.
+
     Returns a dict with:
       center_x, center_y : ring center (subpixel, FULL-IMAGE coords)
       radius, sigma        : ring size and width
@@ -986,7 +1012,8 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
 
     if xc0 is not None:
         fit2d = fit_ring_2d_multistart(img, xc0, yc0, r0_guess, fit_half_size,
-                                        fixed_params=fixed_internal or None)
+                                        fixed_params=fixed_internal or None,
+                                        range_lower_px=range_lower_px, range_upper_px=range_upper_px)
     else:
         fit2d = None
 
@@ -999,7 +1026,7 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
             "center_x": xc + x_off, "center_y": yc + y_off,
             "radius": r0, "sigma": sigma,
             "intensity_peak": A, "intensity_integrated": integrated,
-            "baseline": B,
+            "baseline": B, "snr": fit2d["snr"],
             "r_profile": r_profile, "profile": profile,
             "valid": True, "method": "2d_fit",
         }
@@ -1021,7 +1048,7 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
             "center_x": xc + x_off, "center_y": yc + y_off,
             "radius": np.nan, "sigma": np.nan,
             "intensity_peak": np.nan, "intensity_integrated": np.nan,
-            "baseline": np.nan,
+            "baseline": np.nan, "snr": np.nan,
             "r_profile": np.array([]), "profile": np.array([]),
             "valid": False, "method": "fallback_1d",
         }
@@ -1031,9 +1058,13 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
     # (or not) just above, deciding the center the profile was computed
     # at, so they don't apply to this call.
     fixed_for_1d = {k: v for k, v in fixed_internal.items() if k in ("r0", "sigma", "A", "B")}
+    snr_value = np.nan  # defined up front so it's always available below,
+    # whether or not fit_ring_1d actually ran (the except branch never
+    # touches diagnostics at all)
     try:
         popt, pcov, diagnostics = fit_ring_1d(r_profile, profile, fixed_params=fixed_for_1d)
         B, A, r0, sigma = popt
+        snr_value = diagnostics["snr"]
         fit_ok = (
             np.all(np.isfinite(pcov))
             and diagnostics["peak_found"]
@@ -1054,12 +1085,15 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
         # mistake of plotting/using a result without checking `valid`
         # first (confirmed directly: this is what produced a nonsensical
         # giant circle in a real caller's plot, silently, with no error).
-        # NaN can't be mistaken for a real answer.
+        # NaN can't be mistaken for a real answer. snr itself is the ONE
+        # exception -- kept even on failure (rather than NaN'd out like
+        # everything else) since seeing HOW LOW it was is exactly the
+        # diagnostic you'd want when a fit gets rejected.
         return {
             "center_x": np.nan, "center_y": np.nan,
             "radius": np.nan, "sigma": np.nan,
             "intensity_peak": np.nan, "intensity_integrated": np.nan,
-            "baseline": np.nan,
+            "baseline": np.nan, "snr": snr_value,
             "r_profile": r_profile, "profile": profile,
             "valid": False, "method": "fallback_1d",
         }
@@ -1068,7 +1102,7 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
         "center_x": xc + x_off, "center_y": yc + y_off,
         "radius": r0, "sigma": sigma,
         "intensity_peak": A, "intensity_integrated": integrated,
-        "baseline": B,
+        "baseline": B, "snr": snr_value,
         "r_profile": r_profile, "profile": profile,
         "valid": bool(fit_ok), "method": "fallback_1d",
     }
