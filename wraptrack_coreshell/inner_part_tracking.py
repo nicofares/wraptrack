@@ -8,7 +8,8 @@ segmentation, anchored to quantities we already trust from the ring fit:
 
 1. Estimate the background level (mean, std) from pixels *outside* the ring
    (i.e. far enough from the center that we're clearly off-particle).
-2. Threshold = background_mean + offset. Any pixel above this is "signal".
+2. A pixel is "signal" if |pixel - background_mean| > offset, where offset
+   is either given explicitly or max(n_std * background_std, min_offset).
 3. Restrict the search to a disk around the ring center, out to the radial
    valley between the inner blob and the ring (so we never pick up ring
    pixels as part of the inner object).
@@ -136,11 +137,25 @@ def find_boundary_radius(r_profile, profile, r_ring):
     """
     if r_profile.size == 0 or not np.isfinite(r_ring):
         return None
-    inner = r_profile < r_ring
-    if not np.any(inner):
+
+    # Light smoothing: the innermost bins contain only a handful of pixels
+    # and are very noisy.
+    from scipy.ndimage import uniform_filter1d
+    p_smooth = uniform_filter1d(profile.astype(np.float64), size=3)
+
+    # Search for the valley only BETWEEN the inner-blob peak and the ring,
+    # not over all of r < r_ring. Taking the global minimum over all of
+    # r < r_ring picked r=0.5 on im_3770.png: the central bin holds only
+    # a few pixels and happened to be dark, giving a 1-pixel search disk.
+    blob_zone = r_profile < 0.8 * r_ring
+    if not np.any(blob_zone):
         return None
-    idx_valley = np.argmin(profile[inner])
-    return r_profile[inner][idx_valley]
+    r_blob_peak = r_profile[blob_zone][np.argmax(p_smooth[blob_zone])]
+
+    between = (r_profile > r_blob_peak) & (r_profile < r_ring)
+    if not np.any(between):
+        return None
+    return r_profile[between][np.argmin(p_smooth[between])]
 
 
 def segment_inner_part(img, xc, yc, r_boundary, bg_mean, offset):
@@ -213,7 +228,7 @@ def inner_part_properties(img, obj_mask, bg_mean):
     }
 
 
-def locate_inner_part(img, ring_result=None, n_std=3.0, offset=None,
+def locate_inner_part(img, ring_result=None, n_std=3.0, offset=None, min_offset=5.0,
                        bg_margin_inner=15, bg_margin_outer=45):
     """
     Full pipeline for one frame.
@@ -224,8 +239,18 @@ def locate_inner_part(img, ring_result=None, n_std=3.0, offset=None,
                   in to both this and the ring step).
     n_std       : threshold offset expressed as (this many) x background std,
                   used only if `offset` is not given explicitly.
-    offset      : absolute intensity offset above background mean. If given,
-                  overrides n_std.
+    offset      : absolute threshold, i.e. a pixel counts as signal if
+                  |pixel - bg_mean| > offset (in raw intensity units, e.g.
+                  0-255 for 8-bit). If given, it is used AS IS and overrides
+                  both n_std and min_offset.
+    min_offset  : floor on the automatic (n_std x bg_std) threshold. Only
+                  used when `offset` is None. Needed because the background
+                  can be exactly flat: on frames where nearly all
+                  background pixels are 0, the MAD-based bg_std comes out as
+                  exactly 0, which made the automatic threshold 0 and
+                  turned every nonzero pixel into "signal" (confirmed on
+                  im_3770.png). The automatic threshold is therefore
+                  max(n_std * bg_std, min_offset). Set to 0 to disable.
     bg_margin_inner, bg_margin_outer : define the annulus (beyond the ring)
                   used for the local background estimate. Keep
                   bg_margin_outer well below the typical distance to the
@@ -250,7 +275,7 @@ def locate_inner_part(img, ring_result=None, n_std=3.0, offset=None,
         # trustworthy result for this frame
         return None
     if offset is None:
-        offset = n_std * bg_std
+        offset = max(n_std * bg_std, min_offset)
 
     r_boundary = find_boundary_radius(ring_result["r_profile"], ring_result["profile"], r_ring)
     if r_boundary is None:
