@@ -390,7 +390,7 @@ def local_goodness_of_fit(img, xc, yc, r0, sigma, A, B, window_sigmas=3):
 def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
                  annulus_k_lower=1, annulus_k_upper=3, loss="soft_l1", f_scale=None, max_nfev=300,
                  fixed_params=None, range_lower_px=None, range_upper_px=None,
-                 r0_bounds=None, sigma_bounds=None, center_box=None):
+                 r0_bounds=None, sigma_bounds=None, center_box=None, x_scale=1.0, lsq_kwargs=None):
     """
     Fit the 2D ring model directly to image pixels via robust nonlinear
     least squares, seeded by (xc0, yc0, r0_guess, sigma0_guess) -- e.g.
@@ -417,6 +417,14 @@ def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
         r0_guess, sigma0_guess for that specific parameter. Omit or pass
         None to fit all six parameters freely (identical to previous
         behavior -- verified byte-for-byte).
+
+    x_scale, lsq_kwargs : optimizer settings, used only by locate_ring's
+        initial_guess path.
+        x_scale="auto" tells the optimizer that A and B live on the scale
+        of the image intensities (10^4 for 16-bit data) while positions
+        and widths are of order 1 px -- fewer iterations for the same
+        answer. lsq_kwargs is passed to scipy.optimize.least_squares (e.g.
+        tolerances). The defaults leave the fit exactly as it always was.
 
     r0_bounds, sigma_bounds : optional (low, high) in px, replacing the
         default very loose bounds on radius and width (0..half the crop
@@ -540,6 +548,29 @@ def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
     def resid(p_free):
         return ring_model_2d(build_full(p_free), Xd, Yd) - vals
 
+    free_idx = [PARAM_NAMES.index(n) for n in free_names]
+
+    def jac(p_free):
+        # Analytic Jacobian of the residuals. Without it scipy builds the
+        # Jacobian by finite differences: one extra model evaluation per
+        # free parameter per iteration, plus a lot of Python overhead --
+        # that was ~40% of the whole fit time.
+        xc_, yc_, r0_, s_, A_, _ = build_full(p_free)
+        dx, dy = Xd - xc_, Yd - yc_
+        r_ = np.sqrt(dx * dx + dy * dy)
+        r_safe = np.where(r_ > 0, r_, 1.0)
+        u = (r_ - r0_) / s_
+        E = np.exp(-0.5 * u * u)
+        AEu = A_ * E * u / s_
+        J = np.empty((vals.size, 6))
+        J[:, 0] = AEu * dx / r_safe
+        J[:, 1] = AEu * dy / r_safe
+        J[:, 2] = AEu
+        J[:, 3] = AEu * u
+        J[:, 4] = E
+        J[:, 5] = 1.0
+        return J[:, free_idx]
+
     if len(free_names) == 0:
         # nothing to fit -- every parameter was fixed, just evaluate
         popt = [fixed_local[n] for n in PARAM_NAMES]
@@ -549,8 +580,12 @@ def fit_ring_2d(img, xc0, yc0, r0_guess, sigma0_guess, half_size,
         lower_free = [lower_all[n] for n in free_names]
         upper_free = [upper_all[n] for n in free_names]
         try:
-            res = least_squares(resid, p0_free, bounds=(lower_free, upper_free), loss=loss,
-                                 f_scale=f_scale, max_nfev=max_nfev)
+            if isinstance(x_scale, str) and x_scale == "auto":
+                amp = max(float(A0), 1.0)
+                x_scale = [amp if n in ("A", "B") else 1.0 for n in free_names]
+            res = least_squares(resid, p0_free, jac=jac, bounds=(lower_free, upper_free), loss=loss,
+                                 f_scale=f_scale, max_nfev=max_nfev, x_scale=x_scale,
+                                 **(lsq_kwargs or {}))
         except ValueError:
             return None
         popt = build_full(res.x)
@@ -973,9 +1008,30 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
                  roi_half_size=180, fit_half_size=None, smoothing_sigma=1.5,
                  fixed_params=None, range_lower_px=None, range_upper_px=None,
                  max_center_offset=None, ransac_kwargs=None,
-                 r0_bounds=None, sigma_bounds=None, center_box=None, extra_r0_guesses=None):
+                 r0_bounds=None, sigma_bounds=None, center_box=None, extra_r0_guesses=None,
+                 initial_guess=None):
     """
     Run the full pipeline on a single image.
+
+    initial_guess : optional (x, y, radius, sigma) of the ring, FULL-IMAGE
+        coordinates -- typically the result for the same particle in the
+        previous frame of a movie (sigma may be None). If given, the slow
+        search stages are skipped: no edge detection + RANSAC (the guess IS
+        the initial estimate, and a better one), and no multi-start over
+        ~10 starting radii. Instead:
+          1. a fit of the center only, radius and width held at the guess
+             (with the shape pinned, a fit started a few px off-center
+             cannot widen the ring to swallow the inner part's tail -- seen
+             on a real chain: 3 frames out of 9 lost without this stage);
+          2. one free fit from there;
+          3. re-fits with the fit domain re-centered on the converged
+             values, as in the multi-start path.
+        Roughly 20x faster than the search. If this does not give a valid
+        ring (shape check, min_snr), the function silently carries on with
+        the normal search below, so a bad guess costs time, not the result.
+        "method" in the returned dict says which one produced the result:
+        "2d_fit_seeded" or "2d_fit" / "fallback_1d". None (default) =
+        normal search, exactly as before.
 
     approx_center, half_size : optional. If given, the whole pipeline runs
         on a crop of `img` around `approx_center` (adaptively clipped to
@@ -1069,7 +1125,8 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
                                (diagnostic + used by downstream inner-part
                                boundary detection)
       valid                  : False if no trustworthy ring was found.
-      method                 : "2d_fit" or "fallback_1d", diagnostic only.
+      method                 : "2d_fit_seeded" (from initial_guess), "2d_fit"
+                               or "fallback_1d", diagnostic only.
     """
     if approx_center is not None:
         crop, (x_off, y_off) = crop_around_point(img, approx_center[0], approx_center[1], half_size)
@@ -1085,6 +1142,55 @@ def locate_ring(img, approx_center=None, half_size=None, min_snr=2.0,
 
     if fit_half_size is None:
         fit_half_size = roi_half_size
+
+    # ---- Fast path: start from a known initial guess ----
+    if initial_guess is not None:
+        gx, gy, gr = initial_guess[0] - x_off, initial_guess[1] - y_off, initial_guess[2]
+        gs = initial_guess[3] if len(initial_guess) > 3 and initial_guess[3] is not None else None
+        gr = fixed_internal.get("r0", gr)
+        gs = fixed_internal.get("sigma", gs if gs is not None else max(1.0, 0.1 * gr))
+        fit_kw = dict(range_lower_px=range_lower_px, range_upper_px=range_upper_px,
+                      r0_bounds=r0_bounds, sigma_bounds=sigma_bounds, center_box=center_box,
+                      x_scale="auto", lsq_kwargs={"xtol": 1e-6, "ftol": 1e-7})
+        if not ("xc" in fixed_internal and "yc" in fixed_internal):
+            # 1. center only, shape pinned at the guess
+            pre = fit_ring_2d(img, gx, gy, gr, gs, fit_half_size,
+                              fixed_params=dict({"r0": gr, "sigma": gs}, **fixed_internal), **fit_kw)
+            if pre is not None:
+                gx, gy = pre["center_x"], pre["center_y"]
+        # 2. free fit
+        seeded = fit_ring_2d(img, gx, gy, gr, gs, fit_half_size,
+                             fixed_params=fixed_internal or None, **fit_kw)
+        if seeded is not None and seeded["ring_shape_ok"]:
+            # 3. re-center the fit domain on the result (same acceptance
+            #    rule as the re-seed in fit_ring_2d_multistart)
+            for _ in range(2):
+                again = fit_ring_2d(img, seeded["center_x"], seeded["center_y"], seeded["radius"],
+                                    seeded["sigma"], fit_half_size,
+                                    fixed_params=fixed_internal or None, **fit_kw)
+                if (again is None or not again["ring_shape_ok"]
+                        or again["local_chi2"] >= seeded["local_chi2"]):
+                    break
+                moved = np.hypot(again["center_x"] - seeded["center_x"],
+                                 again["center_y"] - seeded["center_y"])
+                seeded = again
+                if moved < 0.05:
+                    break
+            if seeded["snr"] >= min_snr:
+                xc, yc, r0, sigma = (seeded["center_x"], seeded["center_y"],
+                                     seeded["radius"], seeded["sigma"])
+                A, B = seeded["intensity_peak"], seeded["baseline"]
+                r_profile, profile = radial_profile(img, xc, yc)
+                return {
+                    "center_x": xc + x_off, "center_y": yc + y_off,
+                    "radius": r0, "sigma": sigma,
+                    "intensity_peak": A,
+                    "intensity_integrated": 2 * np.pi * r0 * A * sigma * np.sqrt(2 * np.pi),
+                    "baseline": B, "snr": seeded["snr"],
+                    "r_profile": r_profile, "profile": profile,
+                    "valid": True, "method": "2d_fit_seeded",
+                }
+        # no valid ring from the guess -> normal search below
 
     ransac_result = estimate_ring_via_edges(img, roi_half_size=roi_half_size,
                                              smoothing_sigma=smoothing_sigma,

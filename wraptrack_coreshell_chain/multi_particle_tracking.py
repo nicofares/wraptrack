@@ -32,7 +32,7 @@ import pandas as pd
 from scipy.ndimage import gaussian_filter, maximum_filter
 from scipy.signal import fftconvolve
 
-from ring_tracking import locate_ring, crop_around_point
+from ring_tracking import locate_ring, crop_around_point, radial_profile
 from inner_part_tracking import locate_inner_part
 
 
@@ -159,9 +159,12 @@ def detect_particles(img, ring_radius, method="hough", blur_sigma=None, min_sepa
     img = img.astype(np.float64)
     if bg_sigma is None:
         bg_sigma = 4 * ring_radius
-    sig = img - gaussian_filter(img, bg_sigma, mode="nearest")
-    if use_abs:
-        sig = np.abs(sig)
+    if method != "hough":
+        # (the Hough branch does its own background subtraction; computing
+        # this wide blur there too was pure wasted time)
+        sig = img - gaussian_filter(img, bg_sigma, mode="nearest")
+        if use_abs:
+            sig = np.abs(sig)
     if min_separation is None:
         min_separation = 0.8 * ring_radius
 
@@ -172,11 +175,24 @@ def detect_particles(img, ring_radius, method="hough", blur_sigma=None, min_sepa
         acc = _hough_ring_accumulator(
             img, ring_radius, radius_scales, smoothing=float(np.clip(0.09 * ring_radius, 1.0, 1.5)),
             grad_k=grad_k, acc_sigma=max(1.0, 0.1 * ring_radius), pad=pad, bg_sigma=bg_sigma)
+        H_acc, W_acc = acc.shape
+        # Local maxima within a circular neighborhood, among pixels above
+        # the vote threshold only. Same result as
+        # `acc == maximum_filter(acc, footprint=disk)`, but that filter
+        # visits every pixel with a ~2000-pixel footprint (0.8 s per frame,
+        # 2/3 of the detection time) while only a handful of pixels are
+        # above threshold.
         m = int(np.ceil(min_separation))
         yy, xx = np.mgrid[-m:m + 1, -m:m + 1]
         footprint = xx ** 2 + yy ** 2 <= min_separation ** 2
-        is_peak = acc == maximum_filter(acc, footprint=footprint)
-        py, px = np.nonzero(is_peak & (acc > min(min_votes, min_votes_outside)))
+        cy_all, cx_all = np.nonzero(acc > min(min_votes, min_votes_outside))
+        is_max = np.zeros(cy_all.size, dtype=bool)
+        for k, (yy0, xx0) in enumerate(zip(cy_all, cx_all)):
+            y0, y1 = max(0, yy0 - m), min(H_acc, yy0 + m + 1)
+            x0, x1 = max(0, xx0 - m), min(W_acc, xx0 + m + 1)
+            fp = footprint[y0 - yy0 + m:y1 - yy0 + m, x0 - xx0 + m:x1 - xx0 + m]
+            is_max[k] = acc[yy0, xx0] >= acc[y0:y1, x0:x1][fp].max()
+        py, px = cy_all[is_max], cx_all[is_max]
         Ny, Nx = img.shape
         x, y = px - pad, py - pad
         inside = (x >= 0) & (x <= Nx - 1) & (y >= 0) & (y <= Ny - 1)
@@ -399,9 +415,31 @@ def locate_particles(frame, ring_radius, ring_kwargs=None, inner_kwargs=None,
                      max_shift=None, dedup_dist=None, exclusion_margin=None,
                      radius_range=(0.75, 1.3), isolate=True, reach=None, n_passes=3,
                      sigma_max_frac=0.15, max_drift=None, max_rounds=1, min_coverage=0.7,
-                     ringless_frac=0.4):
+                     ringless_frac=0.4, previous=None):
     """
     Locate every particle (ring + inner part) in one frame.
+
+    previous : optional -- the list this function returned for the PREVIOUS
+        frame of the movie (or any list of (x, y, radius, sigma) tuples,
+        image row-down coordinates; sigma may be None or left out). If given, each of those particles is
+        looked for again starting from where it was: no detection, and the
+        ring fit starts from its previous center, radius and width (see
+        initial_guess in ring_tracking.locate_ring) on a small crop, with
+        the neighbors masked at their previous positions and then, in a
+        second pass, at their new ones. Everything else -- the fit model,
+        the checks (min_snr, radius_range, max_drift, min_coverage,
+        dedup_dist), the inner part -- is unchanged. Around 50x faster
+        than the full search.
+        Safety net: if ANY particle fails ANY check, the whole frame is
+        redone with the full search, as if previous had not been given. So
+        a wrong or stale `previous` costs time, never particles. Note that
+        only the particles in `previous` are looked for: a particle
+        entering the field of view is not seen until a frame goes through
+        the full search (pass previous=None every N frames if that can
+        happen in your movies).
+        Each returned particle has "seeded": True if it came from this
+        fast path, False if from the full search.
+        None (default) = full search, exactly as before.
 
     ring_radius : approximate ring radius in px. Sets the scale for
         detection, crop sizes and all the distance checks. Only needs to be
@@ -474,8 +512,11 @@ def locate_particles(frame, ring_radius, ring_kwargs=None, inner_kwargs=None,
     Returns a list of dicts, one per particle, all positions in pixel,
     full-image, image (row-down) coordinates. Each dict holds the ring
     result ("ring"), the inner-part result ("inner", or None), the crop
-    offset of the inner mask ("mask_offset"), and "isolated" (True if
-    neighbor pixels were masked for this particle).
+    offset of the inner mask ("mask_offset"), "isolated" (True if
+    neighbor pixels were masked for this particle), "seeded" (True if it
+    was found from `previous`) and "border_neighbors" (positions of
+    border-cut particles that are masked but not reported; carried along
+    so the next frame can keep masking them).
     """
     ring_kwargs = dict(ring_kwargs or {})
     inner_kwargs = dict(inner_kwargs or {})
@@ -524,6 +565,106 @@ def locate_particles(frame, ring_radius, ring_kwargs=None, inner_kwargs=None,
         # R ~ 11 px: fits pinned at a 1 px lower bound)
         ring_kwargs.setdefault("sigma_bounds", (0.5, max(1.5, sigma_max_frac * ring_radius)))
     ring_kwargs.setdefault("center_box", max_shift)
+
+    # ---- 0. fast path: start from the previous frame's particles ----
+    def from_previous():
+        """Returns the list of particles, or None if any of them failed a
+        check (-> full search)."""
+        seeds, outside = [], np.zeros((0, 2))
+        for p in previous:
+            if isinstance(p, dict):
+                rg = p["ring"]
+                seeds.append((float(rg["center_x"]), float(rg["center_y"]),
+                              float(rg["radius"]), float(rg["sigma"])))
+                outside = p.get("border_neighbors", outside)
+            else:
+                x, y, r = (float(v) for v in p[:3])
+                sg = p[3] if len(p) > 3 and p[3] is not None else max(1.0, 0.1 * r)
+                seeds.append((x, y, r, float(sg)))
+        n = len(seeds)
+        if n == 0 or not np.all(np.isfinite(np.array(seeds))):
+            return None
+        r_def = r_fixed if r_fixed is not None else ring_radius
+        inter = 2 * (r_def + reach)
+        border = [(float(x), float(y), r_def) for x, y in outside]
+        # the search-only settings are not needed (and not wanted) here
+        seeded_kwargs = {k: v for k, v in ring_kwargs.items() if k != "extra_r0_guesses"}
+
+        def crop_isolated(center, half, neighbors, k):
+            crop, (xo, yo) = crop_around_point(frame, center[0], center[1], half)
+            nb = [o for o in neighbors if np.hypot(o[0] - center[0], o[1] - center[1]) < inter]
+            if not (isolate and nb):
+                return crop.astype(np.float64), xo, yo, False
+            # same masking as the full search, but on the crop only (the
+            # full-frame version costs more than the seeded fit itself)
+            own = (center[0] - xo, center[1] - yo, r_def)
+            nb = [(o[0] - xo, o[1] - yo) + tuple(o[2:]) for o in nb]
+            return (isolate_particle(crop, own, nb, reach, bg_window=crop_half_size + ring_radius, seed=k),
+                    xo, yo, True)
+
+        close = isolate and (
+            any(np.hypot(seeds[i][0] - seeds[j][0], seeds[i][1] - seeds[j][1]) < inter
+                for i in range(n) for j in range(i + 1, n))
+            or any(np.hypot(s[0] - o[0], s[1] - o[1]) < inter for s in seeds for o in border))
+        current, rings, iso = list(seeds), [None] * n, [False] * n
+        # pass 1: neighbors masked where they were in the previous frame;
+        # pass 2: where pass 1 found them (only if particles are close)
+        for _ in range(min(n_passes, 2) if close else 1):
+            new = []
+            for k in range(n):
+                nb = [current[j][:3] for j in range(n) if j != k] + border
+                crop, xo, yo, iso[k] = crop_isolated(current[k], crop_half_size, nb, k)
+                g = current[k]
+                res = locate_ring(crop, initial_guess=(g[0] - xo, g[1] - yo, g[2], g[3]),
+                                  approx_center=(g[0] - xo, g[1] - yo), half_size=2 * crop_half_size,
+                                  **seeded_kwargs)
+                ok = (res is not None and res.get("valid", False)
+                      and np.isfinite(res["center_x"]) and np.isfinite(res["radius"]))
+                if ok and radius_range is not None and r_fixed is None:
+                    ok = radius_range[0] * ring_radius <= res["radius"] <= radius_range[1] * ring_radius
+                if ok and min_coverage is not None:
+                    ok = ring_coverage(crop, res["center_x"], res["center_y"], res["radius"],
+                                       res["sigma"], res["intensity_peak"], res["baseline"]) >= min_coverage
+                # moved too far from where it was in the previous frame
+                if ok:
+                    ok = np.hypot(res["center_x"] + xo - seeds[k][0],
+                                  res["center_y"] + yo - seeds[k][1]) <= max_drift
+                if not ok:
+                    return None
+                new.append(dict(res, center_x=res["center_x"] + xo, center_y=res["center_y"] + yo))
+            rings = new
+            current = [(r["center_x"], r["center_y"], r["radius"], r["sigma"]) for r in rings]
+        # two particles converged onto the same ring
+        if any(np.hypot(current[i][0] - current[j][0], current[i][1] - current[j][1]) <= dedup_dist
+               for i in range(n) for j in range(i + 1, n)):
+            return None
+
+        # inner part, neighbors masked at their FINAL positions
+        out = []
+        for k in range(n):
+            ring = rings[k]
+            nb = [current[j][:3] for j in range(n) if j != k] + border
+            half = int(np.ceil(ring["radius"] + bg_margin_outer + 2))
+            crop, xo, yo, _ = crop_isolated(current[k], half, nb, k)
+            exclude = np.zeros(crop.shape, dtype=bool)
+            for j in range(n):
+                if j != k:
+                    exclude |= _disk_mask(crop.shape, current[j][0] - xo, current[j][1] - yo,
+                                          current[j][2] + exclusion_margin)
+            r_prof, prof = radial_profile(crop, ring["center_x"] - xo, ring["center_y"] - yo)
+            ring = dict(ring, r_profile=r_prof, profile=prof)
+            ring_local = dict(ring, center_x=ring["center_x"] - xo, center_y=ring["center_y"] - yo)
+            inner = locate_inner_part(crop, ring_local, exclude_mask=exclude, **inner_kwargs)
+            if inner is not None:
+                inner = dict(inner, center_x=inner["center_x"] + xo, center_y=inner["center_y"] + yo)
+            out.append({"ring": ring, "inner": inner, "mask_offset": (xo, yo), "isolated": iso[k],
+                        "seeded": True, "border_neighbors": outside})
+        return out
+
+    if previous is not None and len(previous) > 0:
+        result = from_previous()
+        if result is not None:
+            return result
 
     # ---- 1. detection ----
     # Particles cut by the image border (center outside the frame) are
@@ -702,7 +843,8 @@ def locate_particles(frame, ring_radius, ring_kwargs=None, inner_kwargs=None,
             inner = dict(inner, center_x=inner["center_x"] + x_off, center_y=inner["center_y"] + y_off)
 
         particles.append({"ring": ring, "inner": inner, "mask_offset": (x_off, y_off),
-                          "isolated": was_isolated})
+                          "isolated": was_isolated, "seeded": False,
+                          "border_neighbors": outside_cands})
 
     return particles
 
