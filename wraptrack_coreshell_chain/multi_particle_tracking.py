@@ -415,7 +415,7 @@ def locate_particles(frame, ring_radius, ring_kwargs=None, inner_kwargs=None,
                      max_shift=None, dedup_dist=None, exclusion_margin=None,
                      radius_range=(0.75, 1.3), isolate=True, reach=None, n_passes=3,
                      sigma_max_frac=0.15, max_drift=None, max_rounds=1, min_coverage=0.7,
-                     ringless_frac=0.4, previous=None):
+                     ringless_frac=0.4, previous=None, max_step=None):
     """
     Locate every particle (ring + inner part) in one frame.
 
@@ -495,6 +495,11 @@ def locate_particles(frame, ring_radius, ring_kwargs=None, inner_kwargs=None,
         center; a fit that wanders farther has almost always latched onto
         a circle spanning two neighbors (seen on a real chain: a radius-34
         "ring" 20 px off, wedged between two particles).
+    max_step : only used with `previous`. How far (px) a particle may move
+        from its previous-frame position and still be accepted on the fast
+        path; the seeded fits' center box is widened to match. Default
+        1.0 * ring_radius. A particle that moved farther sends the frame to
+        the full search (whose own limit is max_drift).
     max_rounds : "find, mask, find again". After fitting, every validated
         particle is masked out and detection is run again on what is left;
         new candidates are fitted (with neighbors isolated) and the loop
@@ -532,6 +537,8 @@ def locate_particles(frame, ring_radius, ring_kwargs=None, inner_kwargs=None,
         reach = 0.5 * ring_radius
     if max_drift is None:
         max_drift = max_shift
+    if max_step is None:
+        max_step = 1.0 * ring_radius
     # inner-part background annulus: was fixed at 15 / 45 px, which at small
     # magnification (R ~ 11 px) reaches past the whole image
     inner_kwargs.setdefault("bg_margin_inner", 0.5 * ring_radius)
@@ -589,6 +596,9 @@ def locate_particles(frame, ring_radius, ring_kwargs=None, inner_kwargs=None,
         border = [(float(x), float(y), r_def) for x, y in outside]
         # the search-only settings are not needed (and not wanted) here
         seeded_kwargs = {k: v for k, v in ring_kwargs.items() if k != "extra_r0_guesses"}
+        # let each seeded fit's center move as far as max_step allows
+        if seeded_kwargs.get("center_box") is not None:
+            seeded_kwargs["center_box"] = max(seeded_kwargs["center_box"], max_step)
 
         def crop_isolated(center, half, neighbors, k):
             crop, (xo, yo) = crop_around_point(frame, center[0], center[1], half)
@@ -628,7 +638,7 @@ def locate_particles(frame, ring_radius, ring_kwargs=None, inner_kwargs=None,
                 # moved too far from where it was in the previous frame
                 if ok:
                     ok = np.hypot(res["center_x"] + xo - seeds[k][0],
-                                  res["center_y"] + yo - seeds[k][1]) <= max_drift
+                                  res["center_y"] + yo - seeds[k][1]) <= max_step
                 if not ok:
                     return None
                 new.append(dict(res, center_x=res["center_x"] + xo, center_y=res["center_y"] + yo))
